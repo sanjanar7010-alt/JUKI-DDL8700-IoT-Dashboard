@@ -1,361 +1,1418 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+
+# =========================================================
+# PAGE SETUP
+# =========================================================
 
 st.set_page_config(
-    page_title="JUKI DDL-8700 | Smart IoT Dashboard",
+    page_title="JUKI DDL-8700 | Smart IoT",
     page_icon="🧵",
     layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-@st.cache_data
-def make_data(scenario="Normal", n=180):
-    rng = np.random.default_rng(42)
-    t = pd.date_range(datetime.now() - timedelta(minutes=n-1), periods=n, freq="min")
-
-    rpm = rng.normal(3200, 180, n).clip(1800, 5000)
-    stitch_length = rng.normal(2.8, 0.15, n).clip(2.0, 4.0)
-    current = rng.normal(1.45, 0.12, n).clip(0.7, 3.0)
-    vibration = rng.normal(1.65, 0.18, n).clip(0.5, 5.0)
-    temperature = rng.normal(39, 1.2, n).clip(25, 70)
-    power = (110 + 0.045*rpm + 22*current + rng.normal(0, 5, n)).clip(60, 500)
-
-    state = np.array(["SEWING"] * n, dtype=object)
-    fabric = np.array(["Cotton"] * n, dtype=object)
-    layers = np.ones(n, dtype=int)
-    operation = np.array(["Straight seam"] * n, dtype=object)
-
-    if scenario == "High Energy":
-        rpm[-55:] += 700
-        current[-55:] += 0.35
-        power[-55:] += 55
-        stitch_length[-55:] += 0.25
-        fabric[-55:] = "Denim"
-        layers[-55:] = 4
-        operation[-55:] = "Multi-layer seam"
-
-    elif scenario == "Idle Wastage":
-        state[-45:] = "IDLE"
-        rpm[-45:] = rng.normal(250, 60, 45).clip(0, 500)
-        current[-45:] = rng.normal(0.85, 0.06, 45)
-        power[-45:] = rng.normal(75, 5, 45)
-
-    elif scenario == "Machine Deterioration":
-        ramp = np.linspace(0, 1, 60)
-        vibration[-60:] += 2.0 * ramp
-        temperature[-60:] += 12.0 * ramp
-        current[-60:] += 0.55 * ramp
-        power[-60:] += 18 * ramp
-
-    stitches = (rpm * 0.42 + rng.normal(0, 35, n)).clip(100, None)
-    energy_wh = power / 60.0
-    energy_per_stitch = energy_wh / stitches
-
-    expected_energy = (
-        0.052 + 0.0000045*rpm + 0.006*(layers-1) +
-        0.006*(stitch_length-2.8)
-    ).clip(0.03, 0.14)
-
-    actual_energy_metric = energy_per_stitch.clip(0.03, 0.18)
-    energy_deviation = (
-        (actual_energy_metric - expected_energy) / expected_energy * 100
-    )
-
-    vib_dev = vibration - 1.65
-    temp_dev = temperature - 39
-    current_dev = current - 1.45
-
-    anomaly_score = (
-        np.abs(energy_deviation)/25
-        + np.abs(vib_dev)/1.5
-        + np.abs(temp_dev)/10
-        + np.abs(current_dev)/0.5
-    ) / 4
-    anomaly = anomaly_score > 0.85
-
-    energy_issue = energy_deviation > 18
-    process_issue = (layers >= 3) | (fabric == "Denim") | (rpm > 3900)
-    machine_issue = (vibration > 2.8) | (temperature > 50) | (current > 2.0)
-
-    # Correct idle-wastage calculation:
-    # idle energy is based on power consumed while the machine is IDLE,
-    # not on energy per stitch.
-    idle_flag = state == "IDLE"
-    idle_duration_min = np.zeros(n)
-    run = 0
-    for i in range(n):
-        if idle_flag[i]:
-            run += 1
-            idle_duration_min[i] = run
-        else:
-            run = 0
-
-    idle_energy_wh = np.where(idle_flag, power / 60.0, 0.0)
-    idle_energy_percent = np.where(
-        idle_flag,
-        idle_energy_wh / np.maximum(energy_wh, 1e-9) * 100,
-        0.0
-    )
-    idle_wastage = idle_flag & (power > 50) & (idle_duration_min >= 5)
-
-    if scenario == "High Energy":
-        energy_issue[-55:] = True
-        process_issue[-55:] = True
-
-    if scenario == "Machine Deterioration":
-        machine_issue[-60:] = True
-
-    if scenario == "Idle Wastage":
-        idle_wastage[-45:] = True
-
-    cause = np.where(
-        machine_issue,
-        "Mechanical / lubrication issue",
-        np.where(
-            idle_wastage,
-            "Power consumed while machine is idle",
-            np.where(
-                process_issue & energy_issue,
-                "High RPM + material/process load",
-                np.where(
-                    energy_issue,
-                    "Energy above expected baseline",
-                    "No dominant cause"
-                )
-            )
-        )
-    )
-
-    probability = np.clip(
-        55 + 25*anomaly_score + 10*machine_issue +
-        8*energy_issue + 12*idle_wastage,
-        0, 99
-    )
-
-    health_score = (
-        100
-        - 18*np.maximum(vibration-1.8, 0)
-        - 2.2*np.maximum(temperature-42, 0)
-        - 12*np.maximum(current-1.6, 0)
-    ).clip(0, 100)
-
-    return pd.DataFrame({
-        "Time": t,
-        "RPM": rpm,
-        "Stitch Length": stitch_length,
-        "Current (A)": current,
-        "Vibration (mm/s)": vibration,
-        "Temperature (°C)": temperature,
-        "Power (W)": power,
-        "Stitches/min": stitches,
-        "Energy/Stitch": actual_energy_metric,
-        "Expected Energy/Stitch": expected_energy,
-        "Energy Deviation (%)": energy_deviation,
-        "Anomaly Score": anomaly_score,
-        "Anomaly": anomaly,
-        "State": state,
-        "Fabric": fabric,
-        "Layers": layers,
-        "Operation": operation,
-        "Energy Issue": energy_issue,
-        "Process Issue": process_issue,
-        "Machine Issue": machine_issue,
-        "Idle Duration (min)": idle_duration_min,
-        "Idle Energy (Wh)": idle_energy_wh,
-        "Idle Energy (%)": idle_energy_percent,
-        "Idle Wastage": idle_wastage,
-        "Cause": cause,
-        "Probability": probability,
-        "Health Score": health_score,
-    })
-
+# =========================================================
+# CUSTOM DESIGN
+# =========================================================
 
 st.markdown("""
 <style>
-.main {background-color:#f7f9fc;}
-.block-container {padding-top:1.2rem;padding-bottom:2rem;}
-.title {font-size:2rem;font-weight:800;color:#123b63;margin-bottom:0;}
-.subtitle {color:#60758a;font-size:1rem;margin-bottom:1rem;}
+
+.block-container {
+    padding-top: 1rem;
+    max-width: 1500px;
+}
+
+.hero {
+    padding: 25px 30px;
+    border-radius: 18px;
+    background: linear-gradient(135deg, #111a33, #1c2b52);
+    border: 1px solid #30446f;
+    margin-bottom: 20px;
+}
+
+.hero h1 {
+    margin: 0;
+    font-size: 2.2rem;
+}
+
+.hero p {
+    color: #aebbd8;
+    margin-top: 8px;
+}
+
+.section-title {
+    font-size: 1.4rem;
+    font-weight: 700;
+    margin-top: 22px;
+    margin-bottom: 12px;
+}
+
+.card {
+    background: #111a30;
+    border: 1px solid #2b3b68;
+    border-radius: 14px;
+    padding: 15px;
+    min-height: 105px;
+}
+
+.small {
+    color: #9eacc9;
+    font-size: 0.82rem;
+}
+
+.value {
+    font-size: 1.55rem;
+    font-weight: 750;
+    margin-top: 6px;
+}
+
+.pipeline {
+    display: flex;
+    gap: 7px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-bottom: 20px;
+}
+
+.step {
+    padding: 9px 12px;
+    border-radius: 9px;
+    background: #121b34;
+    border: 1px solid #30446f;
+    font-size: 0.82rem;
+}
+
+.arrow {
+    color: #7893c5;
+    font-weight: bold;
+}
+
+.decision {
+    padding: 18px;
+    border-radius: 14px;
+    background: #111a30;
+    min-height: 175px;
+    border: 1px solid #30446f;
+}
+
+.green {
+    border-left: 5px solid #39d98a;
+}
+
+.yellow {
+    border-left: 5px solid #f2c94c;
+}
+
+.red {
+    border-left: 5px solid #ff647c;
+}
+
+.blue {
+    border-left: 5px solid #62a8ff;
+}
+
+.analysis-box {
+    background: #111a30;
+    border: 1px solid #2b3b68;
+    border-radius: 14px;
+    padding: 18px;
+    min-height: 230px;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown(
-    '<div class="title">🧵 SMART IoT ENERGY & CONDITION MONITORING</div>',
-    unsafe_allow_html=True
-)
-st.markdown(
-    '<div class="subtitle">Simulated dashboard — JUKI DDL-8700 industrial 1-needle lockstitch machine</div>',
-    unsafe_allow_html=True
-)
 
-st.sidebar.header("Simulation Controls")
+# =========================================================
+# HELPER FUNCTION
+# =========================================================
+
+def metric_card(label, value, sub=""):
+    st.markdown(
+        f"""
+        <div class="card">
+            <div class="small">{label}</div>
+            <div class="value">{value}</div>
+            <div class="small">{sub}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# =========================================================
+# HEADER
+# =========================================================
+
+st.markdown("""
+<div class="hero">
+
+<h1>🧵 JUKI DDL-8700 — Smart IoT Energy & Condition Monitoring</h1>
+
+<p>
+Low-cost IoT retrofit simulation:
+Sensor Data → Analysis → Cause Identification → Decision Engine
+→ Optimization / Recommendation / Maintenance
+</p>
+
+</div>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+
+st.sidebar.header("⚙️ Simulation Controls")
+
 scenario = st.sidebar.selectbox(
-    "Scenario",
-    ["Normal", "High Energy", "Idle Wastage", "Machine Deterioration"]
+    "Machine Scenario",
+    [
+        "Normal Sewing",
+        "Controllable Energy — High RPM",
+        "Controllable Energy — Idle Wastage",
+        "Process / Operator / Material Issue",
+        "Machine Condition Deterioration"
+    ]
 )
-refresh = st.sidebar.slider("Displayed time window (minutes)", 30, 180, 120)
+
+fabric = st.sidebar.selectbox(
+    "Fabric Type",
+    [
+        "Cotton",
+        "Denim",
+        "Polyester",
+        "Knit"
+    ]
+)
+
+layers = st.sidebar.slider(
+    "Fabric Layers",
+    1,
+    8,
+    2
+)
+
+rpm = st.sidebar.slider(
+    "Sewing Speed (RPM)",
+    500,
+    5000,
+    3000,
+    100
+)
+
+stitch_length = st.sidebar.slider(
+    "Stitch Length (mm)",
+    1.0,
+    5.0,
+    2.5,
+    0.1
+)
+
+acceleration = st.sidebar.slider(
+    "Acceleration Setting",
+    1,
+    10,
+    5
+)
+
+st.sidebar.divider()
+
 st.sidebar.caption(
-    "All values are simulated for prototype demonstration; they are not live machine measurements."
+    "Simulation values represent the expected behaviour "
+    "of the proposed JUKI DDL-8700 IoT retrofit system."
 )
 
-df = make_data(scenario)
-view = df.tail(refresh).copy()
-latest = view.iloc[-1]
 
-c1,c2,c3,c4,c5,c6 = st.columns(6)
-c1.metric("Machine","DDL-8700")
-c2.metric("State",latest["State"])
-c3.metric("RPM",f'{latest["RPM"]:,.0f}')
-c4.metric("Power",f'{latest["Power (W)"]:.0f} W')
-c5.metric("Temperature",f'{latest["Temperature (°C)"]:.1f} °C')
-c6.metric("Health Score",f'{latest["Health Score"]:.0f}%')
+# =========================================================
+# SIMULATED SENSOR DATA
+# =========================================================
+
+if scenario == "Normal Sewing":
+
+    machine_state = "SEWING"
+
+    power = 185
+    current = 1.25
+    vibration = 1.7
+    temperature = 42
+
+    idle_duration = 0
+
+    process_issue = False
+    machine_issue = False
+
+
+elif scenario == "Controllable Energy — High RPM":
+
+    machine_state = "SEWING"
+
+    power = 255
+    current = 1.65
+    vibration = 1.9
+    temperature = 45
+
+    idle_duration = 0
+
+    process_issue = False
+    machine_issue = False
+
+
+elif scenario == "Controllable Energy — Idle Wastage":
+
+    machine_state = "IDLE"
+
+    power = 75
+    current = 0.85
+    vibration = 1.1
+    temperature = 38
+
+    idle_duration = 45
+
+    process_issue = False
+    machine_issue = False
+
+
+elif scenario == "Process / Operator / Material Issue":
+
+    machine_state = "SEWING"
+
+    power = 245
+    current = 1.55
+    vibration = 1.9
+    temperature = 44
+
+    idle_duration = 0
+
+    process_issue = True
+    machine_issue = False
+
+
+else:
+
+    machine_state = "SEWING"
+
+    power = 238
+    current = 1.58
+    vibration = 4.8
+    temperature = 61
+
+    idle_duration = 0
+
+    process_issue = False
+    machine_issue = True
+
+
+# =========================================================
+# MATERIAL / PROCESS EFFECT
+# =========================================================
+
+material_factor = {
+
+    "Cotton": 1.00,
+    "Denim": 1.15,
+    "Polyester": 0.98,
+    "Knit": 1.05
+
+}[fabric]
+
+layer_factor = 1 + (layers - 1) * 0.055
+
+stitch_factor = 1 + (stitch_length - 2.5) * 0.025
+
+
+# =========================================================
+# EXPECTED ENERGY MODEL
+# =========================================================
+
+if machine_state == "IDLE":
+
+    expected_power = 8
+
+else:
+
+    expected_power = (
+        190
+        + (rpm - 3000) * 0.025
+    )
+
+    expected_power *= material_factor
+    expected_power *= layer_factor
+    expected_power *= stitch_factor
+
+
+# =========================================================
+# ENERGY CALCULATIONS
+# =========================================================
+
+energy_deviation = power - expected_power
+
+energy_deviation_percent = (
+    energy_deviation / expected_power
+) * 100
+
+
+# =========================================================
+# PRODUCTION CALCULATIONS
+# =========================================================
+
+simulation_minutes = 60
+
+if machine_state == "SEWING":
+
+    stitch_count = int(
+        rpm * simulation_minutes * 0.72
+    )
+
+else:
+
+    stitch_count = 0
+
+
+energy_wh = power * simulation_minutes / 60
+
+idle_energy_wh = (
+    power * idle_duration / 60
+)
+
+if energy_wh > 0:
+
+    idle_energy_percent = (
+        idle_energy_wh / energy_wh
+    ) * 100
+
+else:
+
+    idle_energy_percent = 0
+
+
+if stitch_count > 0:
+
+    energy_per_stitch = (
+        energy_wh / stitch_count
+    )
+
+else:
+
+    energy_per_stitch = 0
+
+
+# =========================================================
+# COMMON ANALYSIS
+# =========================================================
+
+energy_anomaly = False
+
+if machine_state == "IDLE":
+
+    if idle_energy_wh > 5:
+
+        energy_anomaly = True
+
+else:
+
+    if power > expected_power * 1.10:
+
+        energy_anomaly = True
+
+
+# Vibration anomaly
+vibration_anomaly = vibration > 3.5
+
+# Temperature anomaly
+temperature_anomaly = temperature > 55
+
+# Current anomaly
+current_anomaly = current > 2.0
+
+
+# =========================================================
+# MACHINE CONDITION ANALYSIS
+# =========================================================
+
+machine_condition_anomaly = (
+
+    vibration_anomaly
+    or
+    temperature_anomaly
+    or
+    current_anomaly
+)
+
+
+# =========================================================
+# PROCESS / MATERIAL ANALYSIS
+# =========================================================
+
+process_material_anomaly = process_issue
+
+
+# =========================================================
+# FINAL CAUSE DECISION
+# =========================================================
+
+if machine_condition_anomaly:
+
+    final_output = "MAINTENANCE ALERT"
+
+    probable_cause = "Machine-condition deterioration"
+
+    probability = 0.91
+
+    automatic_optimization_allowed = False
+
+
+elif process_material_anomaly:
+
+    final_output = "WARNING / RECOMMENDATION"
+
+    probable_cause = "Process / Operator / Material"
+
+    probability = 0.88
+
+    automatic_optimization_allowed = False
+
+
+elif energy_anomaly:
+
+    final_output = "AUTO OPTIMIZATION"
+
+    probable_cause = "Controllable energy parameter"
+
+    probability = 0.94
+
+    automatic_optimization_allowed = True
+
+
+else:
+
+    final_output = "NORMAL"
+
+    probable_cause = "No significant abnormality"
+
+    probability = 0.96
+
+    automatic_optimization_allowed = False
+
+
+# =========================================================
+# OPTIMIZATION
+# =========================================================
+
+if scenario == "Controllable Energy — Idle Wastage":
+
+    optimization_action = "AUTO STANDBY"
+
+    optimized_setting = "STANDBY / POWER-SAVING"
+
+    optimized_power = 8
+
+    power_saving = power - optimized_power
+
+    saving_percent = (
+        power_saving / power
+    ) * 100
+
+    optimization_message = (
+        "Idle energy is caused by a controllable machine state. "
+        "The system automatically requests standby / power-saving mode."
+    )
+
+
+elif scenario == "Controllable Energy — High RPM":
+
+    optimized_rpm = max(
+        1200,
+        rpm - 500
+    )
+
+    optimization_action = "RPM OPTIMIZATION"
+
+    optimized_setting = (
+        f"{optimized_rpm:,} RPM"
+    )
+
+    optimized_power = max(
+        150,
+        power - 38
+    )
+
+    power_saving = power - optimized_power
+
+    saving_percent = (
+        power_saving / power
+    ) * 100
+
+    optimization_message = (
+        "Energy consumption is high, but no process/material "
+        "or machine-condition cause was detected. "
+        "A safe RPM reduction is therefore eligible."
+    )
+
+
+else:
+
+    optimization_action = "NO AUTOMATIC CHANGE"
+
+    optimized_setting = "No automatic change"
+
+    optimized_power = power
+
+    power_saving = 0
+
+    saving_percent = 0
+
+    optimization_message = (
+        "Automatic optimization is inhibited."
+    )
+
+
+# =========================================================
+# MACHINE HEALTH SCORE
+# =========================================================
+
+health_score = (
+    100
+    - vibration * 7
+    - max(0, temperature - 40) * 0.8
+)
+
+health_score = max(
+    0,
+    min(100, health_score)
+)
+
+if machine_issue:
+
+    health_score = 58
+
+
+# =========================================================
+# SYSTEM DATA FLOW
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">🔄 System Data & Analysis Flow</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown("""
+<div class="pipeline">
+
+<div class="step">Sensors</div>
+<div class="arrow">→</div>
+
+<div class="step">ESP32</div>
+<div class="arrow">→</div>
+
+<div class="step">Wi-Fi / MQTT</div>
+<div class="arrow">→</div>
+
+<div class="step">InfluxDB + SQL</div>
+<div class="arrow">→</div>
+
+<div class="step">Preprocessing</div>
+<div class="arrow">→</div>
+
+<div class="step">Feature Extraction</div>
+<div class="arrow">→</div>
+
+<div class="step">Common Analysis</div>
+<div class="arrow">→</div>
+
+<div class="step">Integrated Analysis</div>
+<div class="arrow">→</div>
+
+<div class="step">XGBoost</div>
+<div class="arrow">→</div>
+
+<div class="step">Bayesian Network</div>
+<div class="arrow">→</div>
+
+<div class="step">Decision Engine</div>
+
+</div>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# MACHINE OVERVIEW
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">1. 🧵 Live Machine Overview</div>',
+    unsafe_allow_html=True
+)
+
+cols = st.columns(6)
+
+with cols[0]:
+    metric_card(
+        "Machine",
+        "JUKI DDL-8700",
+        "IoT retrofit"
+    )
+
+with cols[1]:
+    metric_card(
+        "Machine State",
+        machine_state,
+        "State classification"
+    )
+
+with cols[2]:
+    metric_card(
+        "RPM",
+        f"{rpm:,}",
+        "Sewing speed"
+    )
+
+with cols[3]:
+    metric_card(
+        "Power",
+        f"{power:.0f} W",
+        "Active power"
+    )
+
+with cols[4]:
+    metric_card(
+        "Energy",
+        f"{energy_wh:.1f} Wh",
+        "1-hour simulation"
+    )
+
+with cols[5]:
+    metric_card(
+        "Health",
+        f"{health_score:.0f}%",
+        "Machine condition"
+    )
+
+
+# =========================================================
+# SENSOR DATA
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">2. 📡 Sensor Data Received</div>',
+    unsafe_allow_html=True
+)
+
+cols = st.columns(6)
+
+with cols[0]:
+    metric_card(
+        "Voltage",
+        "230 V",
+        "PZEM-004T"
+    )
+
+with cols[1]:
+    metric_card(
+        "Current",
+        f"{current:.2f} A",
+        "Energy / motor current"
+    )
+
+with cols[2]:
+    metric_card(
+        "Vibration",
+        f"{vibration:.1f}",
+        "MPU6050 RMS"
+    )
+
+with cols[3]:
+    metric_card(
+        "Temperature",
+        f"{temperature:.0f} °C",
+        "DS18B20"
+    )
+
+with cols[4]:
+    metric_card(
+        "RPM",
+        f"{rpm:,}",
+        "Pulse sensor"
+    )
+
+with cols[5]:
+    metric_card(
+        "Stitch Count",
+        f"{stitch_count:,}",
+        "Output detection"
+    )
+
+
+# =========================================================
+# ANALYSIS ENGINE
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">3. 🧠 Analysis Engine</div>',
+    unsafe_allow_html=True
+)
+
+a, b, c = st.columns(3)
+
+with a:
+
+    st.markdown(
+        '<div class="analysis-box">',
+        unsafe_allow_html=True
+    )
+
+    st.markdown("### Common Analysis")
+
+    st.write("✓ Rolling Mean + SD → normal baseline")
+
+    st.write("✓ Linear Regression → trends")
+
+    st.write("✓ Isolation Forest → multivariate anomaly")
+
+    st.write(
+        f"✓ Machine State → **{machine_state}**"
+    )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+with b:
+
+    st.markdown(
+        '<div class="analysis-box">',
+        unsafe_allow_html=True
+    )
+
+    st.markdown("### Integrated Analysis")
+
+    st.write(
+        f"Energy model → expected **{expected_power:.1f} W**"
+    )
+
+    st.write(
+        f"Actual − expected → **{energy_deviation:+.1f} W**"
+    )
+
+    st.write(
+        f"Process / Material → "
+        f"**{'ABNORMAL' if process_material_anomaly else 'NORMAL'}**"
+    )
+
+    st.write(
+        f"Machine Condition → "
+        f"**{'ABNORMAL' if machine_condition_anomaly else 'NORMAL'}**"
+    )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+with c:
+
+    st.markdown(
+        '<div class="analysis-box">',
+        unsafe_allow_html=True
+    )
+
+    st.markdown("### Cause Identification")
+
+    st.write(
+        f"XGBoost Multi-Label → **{final_output}**"
+    )
+
+    st.write(
+        f"Bayesian Network → **{probable_cause}**"
+    )
+
+    st.write(
+        f"Probability → **{probability:.0%}**"
+    )
+
+    st.write(
+        "Decision Engine → final action"
+    )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# =========================================================
+# ENERGY PERFORMANCE
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">4. ⚡ Energy Performance</div>',
+    unsafe_allow_html=True
+)
+
+cols = st.columns(4)
+
+with cols[0]:
+    metric_card(
+        "Expected Power",
+        f"{expected_power:.1f} W",
+        "XGBoost energy model"
+    )
+
+with cols[1]:
+    metric_card(
+        "Energy Deviation",
+        f"{energy_deviation:+.1f} W",
+        f"{energy_deviation_percent:+.1f}%"
+    )
+
+with cols[2]:
+    metric_card(
+        "Energy / Stitch",
+        (
+            f"{energy_per_stitch:.4f} Wh"
+            if stitch_count > 0
+            else "N/A"
+        ),
+        "Productivity measure"
+    )
+
+with cols[3]:
+    metric_card(
+        "Idle Energy",
+        f"{idle_energy_wh:.1f} Wh",
+        f"{idle_energy_percent:.1f}% of energy"
+    )
+
+
+# =========================================================
+# PROCESS / MATERIAL
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">5. 🧵 Process & Material Context</div>',
+    unsafe_allow_html=True
+)
+
+cols = st.columns(4)
+
+with cols[0]:
+    metric_card(
+        "Fabric",
+        fabric,
+        "Material type"
+    )
+
+with cols[1]:
+    metric_card(
+        "Layers",
+        layers,
+        "Fabric plies"
+    )
+
+with cols[2]:
+    metric_card(
+        "Stitch Length",
+        f"{stitch_length:.1f} mm",
+        "Machine setting"
+    )
+
+with cols[3]:
+    metric_card(
+        "Acceleration",
+        acceleration,
+        "Control setting"
+    )
+
+
+# =========================================================
+# MACHINE CONDITION
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">6. 🔧 Machine Condition</div>',
+    unsafe_allow_html=True
+)
+
+cols = st.columns(4)
+
+with cols[0]:
+    metric_card(
+        "Vibration",
+        f"{vibration:.1f}",
+        "MPU6050"
+    )
+
+with cols[1]:
+    metric_card(
+        "Temperature",
+        f"{temperature:.0f} °C",
+        "DS18B20"
+    )
+
+with cols[2]:
+    metric_card(
+        "Motor Current",
+        f"{current:.2f} A",
+        "Current signature"
+    )
+
+with cols[3]:
+    metric_card(
+        "Health Score",
+        f"{health_score:.0f}%",
+        "Condition estimate"
+    )
+
+
+# =========================================================
+# SENSOR TRENDS
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">7. 📈 Sensor Trends</div>',
+    unsafe_allow_html=True
+)
+
+rng = np.random.default_rng(42)
+
+time = pd.date_range(
+    "2026-09-14 09:00",
+    periods=60,
+    freq="min"
+)
+
+power_trend = rng.normal(
+    power,
+    max(2, power * 0.035),
+    60
+)
+
+vibration_trend = rng.normal(
+    vibration,
+    0.10,
+    60
+)
+
+temperature_trend = np.linspace(
+    max(30, temperature - 4),
+    temperature,
+    60
+)
+
+trend = pd.DataFrame(
+    {
+        "Power (W)": power_trend,
+        "Vibration": vibration_trend,
+        "Temperature (°C)": temperature_trend
+    },
+    index=time
+)
+
+if machine_state == "IDLE":
+
+    trend.iloc[:45, 0] = rng.normal(
+        185,
+        5,
+        45
+    )
+
+    trend.iloc[45:, 0] = rng.normal(
+        75,
+        2,
+        15
+    )
+
+
+c1, c2 = st.columns(2)
+
+with c1:
+
+    st.markdown("**Power Consumption**")
+
+    st.line_chart(
+        trend[["Power (W)"]],
+        height=280
+    )
+
+with c2:
+
+    st.markdown("**Machine Condition**")
+
+    st.line_chart(
+        trend[
+            [
+                "Vibration",
+                "Temperature (°C)"
+            ]
+        ],
+        height=280
+    )
+
+
+# =========================================================
+# IDLE AUTO OPTIMIZATION
+# =========================================================
+
+if scenario == "Controllable Energy — Idle Wastage":
+
+    st.markdown(
+        '<div class="section-title">8. ⚡ Idle Wastage → Automatic Optimization</div>',
+        unsafe_allow_html=True
+    )
+
+    st.success(
+        f"""
+        **Idle energy wastage confirmed.**
+
+        Machine is idle for **{idle_duration} minutes**
+        while consuming **{idle_energy_wh:.1f} Wh**.
+
+        No process/material or machine-condition abnormality was detected.
+
+        Therefore, the energy wastage is classified as a
+        **controllable parameter** and automatic standby is permitted.
+        """
+    )
+
+    cols = st.columns(4)
+
+    with cols[0]:
+        metric_card(
+            "Idle Duration",
+            f"{idle_duration} min",
+            "No sewing output"
+        )
+
+    with cols[1]:
+        metric_card(
+            "Before",
+            f"{power:.0f} W",
+            "Idle consumption"
+        )
+
+    with cols[2]:
+        metric_card(
+            "Automatic Action",
+            "STANDBY",
+            "Power-saving mode"
+        )
+
+    with cols[3]:
+        metric_card(
+            "After",
+            f"{optimized_power:.0f} W",
+            f"Saving ≈ {power_saving:.0f} W"
+        )
+
+
+# =========================================================
+# FINAL THREE OUTPUTS
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">9. 🎯 Decision Engine — Final Outputs</div>',
+    unsafe_allow_html=True
+)
+
+o1, o2, o3 = st.columns(3)
+
+
+# ---------------------------------------------------------
+# OPTIMIZATION
+# ---------------------------------------------------------
+
+with o1:
+
+    st.markdown(
+        f"""
+        <div class="decision green">
+
+        <h3>🟢 Optimization</h3>
+
+        <p>
+        <b>Status:</b>
+        {"AUTO-OPTIMIZATION ELIGIBLE"
+        if automatic_optimization_allowed
+        else "INHIBITED"}
+        </p>
+
+        <p>
+        <b>Action:</b>
+        {optimized_setting}
+        </p>
+
+        <p>
+        {optimization_message}
+        </p>
+
+        <p>
+        <b>Expected Saving:</b>
+        {power_saving:.0f} W
+        ({saving_percent:.1f}%)
+        </p>
+
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# ---------------------------------------------------------
+# WARNING / RECOMMENDATION
+# ---------------------------------------------------------
+
+with o2:
+
+    if process_material_anomaly:
+
+        warning_status = "ACTION REQUIRED"
+
+        warning_text = (
+            "Energy consumption is associated with "
+            "process/operator/material conditions."
+        )
+
+        recommendation = (
+            f"Check {fabric} fabric, {layers} layers, "
+            f"stitch length, handling and operator practice."
+        )
+
+    else:
+
+        warning_status = "NO WARNING"
+
+        warning_text = (
+            "No process/operator/material abnormality detected."
+        )
+
+        recommendation = (
+            "Continue monitoring process and material context."
+        )
+
+    st.markdown(
+        f"""
+        <div class="decision yellow">
+
+        <h3>🟡 Warning / Recommendation</h3>
+
+        <p>
+        <b>Status:</b>
+        {warning_status}
+        </p>
+
+        <p>
+        {warning_text}
+        </p>
+
+        <p>
+        {recommendation}
+        </p>
+
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# ---------------------------------------------------------
+# MAINTENANCE ALERT
+# ---------------------------------------------------------
+
+with o3:
+
+    if machine_condition_anomaly:
+
+        maintenance_status = "MAINTENANCE REQUIRED"
+
+        maintenance_text = (
+            f"Abnormal machine-condition evidence detected. "
+            f"Vibration = {vibration:.1f}, "
+            f"Temperature = {temperature:.0f} °C, "
+            f"Current = {current:.2f} A."
+        )
+
+        maintenance_action = (
+            "Inspect lubrication, bearings, alignment and motor condition."
+        )
+
+    else:
+
+        maintenance_status = "NO ALERT"
+
+        maintenance_text = (
+            "Machine-condition parameters are within "
+            "the simulated healthy range."
+        )
+
+        maintenance_action = (
+            "Continue condition monitoring."
+        )
+
+    st.markdown(
+        f"""
+        <div class="decision red">
+
+        <h3>🔴 Maintenance Alert</h3>
+
+        <p>
+        <b>Status:</b>
+        {maintenance_status}
+        </p>
+
+        <p>
+        {maintenance_text}
+        </p>
+
+        <p>
+        {maintenance_action}
+        </p>
+
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# =========================================================
+# OPTIMIZATION SAFETY GATE
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">10. 🛡️ Optimization Supervisor / Safety Gate</div>',
+    unsafe_allow_html=True
+)
+
+checks = pd.DataFrame(
+    {
+        "Safety / Control Check": [
+            "Data Quality",
+            "Machine Condition Inhibit",
+            "RPM / Setpoint Limits",
+            "Process Constraints",
+            "Operator Override",
+            "Command Acknowledgement"
+        ],
+
+        "Result": [
+
+            "PASS",
+
+            (
+                "BLOCKED"
+                if machine_condition_anomaly
+                else "PASS"
+            ),
+
+            "PASS",
+
+            (
+                "BLOCKED"
+                if process_material_anomaly
+                else "PASS"
+            ),
+
+            "NO OVERRIDE",
+
+            "SIMULATED ACK"
+        ]
+    }
+)
+
+st.dataframe(
+    checks,
+    use_container_width=True,
+    hide_index=True
+)
+
+
+# =========================================================
+# CLOSED LOOP
+# =========================================================
+
+if automatic_optimization_allowed:
+
+    st.info(
+        """
+        **Closed-loop optimization active:**
+
+        Approved setting → JUKI control system → sewing motor
+        → sensor feedback → energy measurement
+        → compare with target → maintain / adjust setting.
+        """
+    )
+
+
+# =========================================================
+# ML / ANALYTICS
+# =========================================================
+
+st.markdown(
+    '<div class="section-title">11. 🤖 ML & Analytics Used</div>',
+    unsafe_allow_html=True
+)
+
+tools = pd.DataFrame(
+    {
+        "Method": [
+
+            "Rolling Mean + SD",
+
+            "Linear Regression",
+
+            "Isolation Forest",
+
+            "StandardScaler",
+
+            "XGBoost Regressor — Energy",
+
+            "XGBoost Regressor — Machine Health",
+
+            "XGBoost Multi-Label Classifier",
+
+            "Bayesian Network",
+
+            "Grid / Bounded Search",
+
+            "Closed-Loop Control"
+        ],
+
+        "Role in Project": [
+
+            "Establish healthy operating baseline",
+
+            "Detect trends in energy and machine variables",
+
+            "Detect multivariate abnormal behaviour",
+
+            "Normalize continuous features",
+
+            "Predict expected energy from RPM, process and material context",
+
+            "Predict expected vibration/current/temperature behaviour",
+
+            "Classify abnormality as Energy, Process/Material or Machine",
+
+            "Infer probable cause and probability",
+
+            "Search safe RPM values for efficient operation",
+
+            "Measure → Compare → Correct controllable setting"
+        ]
+    }
+)
+
+st.dataframe(
+    tools,
+    use_container_width=True,
+    hide_index=True
+)
+
+
+# =========================================================
+# FOOTER
+# =========================================================
 
 st.divider()
 
-left,right = st.columns(2)
-with left:
-    st.subheader("Energy Performance")
-    st.line_chart(
-        view.set_index("Time")[["Energy/Stitch","Expected Energy/Stitch"]],
-        height=280
-    )
-    st.caption("Actual vs expected energy — proposed XGBoost Regressor output.")
-
-with right:
-    st.subheader("Machine Condition")
-    q = view.set_index("Time")[[
-        "Vibration (mm/s)","Temperature (°C)","Current (A)"
-    ]].copy()
-    for col in q.columns:
-        mn,mx=q[col].min(),q[col].max()
-        q[col]=(q[col]-mn)/(mx-mn) if mx>mn else 0
-    st.line_chart(q,height=280)
-    st.caption("Normalized vibration, temperature and current trends.")
-
-# Dedicated idle-wastage section
-if scenario == "Idle Wastage":
-    st.subheader("⚠️ Idle Energy Wastage")
-    i1,i2,i3,i4 = st.columns(4)
-
-    idle_duration = float(latest["Idle Duration (min)"])
-    idle_power = float(latest["Power (W)"])
-    idle_energy = float(view["Idle Energy (Wh)"].sum())
-    total_energy = float(view["Power (W)"].sum()/60.0)
-    idle_share = idle_energy/max(total_energy,1e-9)*100
-
-    i1.metric("Machine State","IDLE")
-    i2.metric("Idle Power",f"{idle_power:.1f} W")
-    i3.metric("Idle Duration",f"{idle_duration:.0f} min")
-    i4.metric("Idle Energy",f"{idle_energy:.1f} Wh")
-
-    st.warning(
-        f"**Idle energy wastage detected:** the machine is consuming approximately "
-        f"**{idle_power:.1f} W** while not actively sewing. "
-        f"Idle energy represents about **{idle_share:.1f}%** of the displayed energy."
-    )
-    st.caption(
-        "Recommended action: move the machine to standby or switch it off when sewing "
-        "is not required. This is a Warning / Recommendation, not a maintenance fault."
-    )
-
-st.subheader("Process / Material Context")
-p1,p2,p3,p4=st.columns(4)
-p1.metric("Fabric",str(latest["Fabric"]))
-p2.metric("Layers",int(latest["Layers"]))
-p3.metric("Stitch Length",f'{latest["Stitch Length"]:.2f} mm')
-p4.metric("Operation",str(latest["Operation"]))
-
-st.subheader("Decision Engine — Final Outputs")
-energy_dev=float(latest["Energy Deviation (%)"])
-machine_issue=bool(latest["Machine Issue"])
-process_issue=bool(latest["Process Issue"])
-energy_issue=bool(latest["Energy Issue"])
-idle_wastage=bool(latest["Idle Wastage"])
-
-if energy_issue and not machine_issue and not idle_wastage:
-    current_rpm=float(latest["RPM"])
-    recommended_rpm=max(2500,min(current_rpm*.90,4500))
-    saving=max(5,min(20,(current_rpm-recommended_rpm)/current_rpm*100+7))
-    opt_title="OPTIMIZATION APPROVED"
-    opt_text=f"Reduce sewing speed from {current_rpm:,.0f} to {recommended_rpm:,.0f} RPM."
-    opt_detail=f"Estimated energy saving: {saving:.1f}%"
-else:
-    opt_title="OPTIMIZATION INHIBITED"
-    opt_text="No automatic setpoint change for the current condition."
-    opt_detail=(
-        "Idle wastage requires standby/off action; machine-risk conditions require inspection."
-        if idle_wastage or machine_issue else "Keep the current safe setting."
-    )
-
-if idle_wastage:
-    warn_text=(
-        f"Machine is IDLE but consuming {latest['Power (W)']:.1f} W. "
-        "Use standby or switch off when sewing is not required."
-    )
-elif energy_issue or process_issue:
-    warn_text=(
-        f"High energy/process deviation ({energy_dev:+.1f}%). "
-        "Check RPM, fabric thickness/layers and sewing conditions."
-    )
-else:
-    warn_text="Energy and process behaviour are within the simulated baseline."
-
-if machine_issue:
-    maint_text=f"Condition anomaly detected. Probable cause: {latest['Cause']}."
-    maint_detail=f"Cause probability: {latest['Probability']:.0f}%. Inspect before continued operation."
-else:
-    maint_text="No significant machine-condition deterioration detected."
-    maint_detail="Continue monitoring vibration, temperature and motor current."
-
-o1,o2,o3=st.columns(3)
-with o1:
-    st.success(f"### 🟢 Optimization\n\n{opt_title}\n\n{opt_text}\n\n{opt_detail}")
-with o2:
-    if idle_wastage:
-        st.warning(f"### 🟡 Warning / Recommendation\n\n**IDLE ENERGY WASTAGE**\n\n{warn_text}")
-    elif energy_issue or process_issue:
-        st.warning(f"### 🟡 Warning / Recommendation\n\n{warn_text}")
-    else:
-        st.info(f"### 🟡 Warning / Recommendation\n\n{warn_text}")
-with o3:
-    if machine_issue:
-        st.error(f"### 🔴 Maintenance Alert\n\n**MAINTENANCE REQUIRED**\n\n{maint_text}\n\n{maint_detail}")
-    else:
-        st.info(f"### 🔴 Maintenance Alert\n\n**NORMAL**\n\n{maint_text}\n\n{maint_detail}")
-
-st.subheader("ML / Analytics Engine")
-tools=pd.DataFrame({
-    "Tool / Model":[
-        "Rolling Mean + SD","Linear Regression","Isolation Forest",
-        "XGBoost Regressor — Expected Energy",
-        "XGBoost Regressor — Expected Machine Health",
-        "XGBoost Multi-label Classifier","Bayesian Network",
-        "StandardScaler (Z-score)","Grid / Bounded Search",
-        "Rule-based Decision Engine"
-    ],
-    "Role":[
-        "Normal baseline","Trend analysis","Multivariate anomaly detection",
-        "Actual vs expected energy","Actual vs expected health parameters",
-        "Energy / Process-Material / Machine issue classification",
-        "Probable cause + probability","Feature normalization",
-        "Find energy-efficient safe RPM/setpoint",
-        "Final action selection + safety constraints"
-    ],
-    "Status":["ACTIVE"]*10
-})
-st.dataframe(tools,use_container_width=True,hide_index=True)
-
-with st.expander("View simulated sensor data"):
-    cols=[
-        "Time","RPM","Current (A)","Power (W)","Energy/Stitch",
-        "Vibration (mm/s)","Temperature (°C)","Fabric","Layers",
-        "Energy Deviation (%)","Idle Duration (min)","Idle Energy (Wh)",
-        "Idle Energy (%)","Anomaly Score","State","Cause"
-    ]
-    st.dataframe(view[cols].tail(40),use_container_width=True,hide_index=True)
-
 st.caption(
-    "Prototype note: this dashboard demonstrates the expected outcome using synthetic "
-    "sewing-machine data. Replace the simulator with ESP32/MQTT/InfluxDB data when hardware is connected."
+    "Simulation dashboard — sensor values and model outputs are synthetic. "
+    "The dashboard demonstrates the expected architecture and decision logic "
+    "of the proposed low-cost IoT retrofit system for the JUKI DDL-8700."
 )
