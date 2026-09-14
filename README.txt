@@ -1,0 +1,1 @@
+Replace your existing app.py with this app.py, save it, then refresh localhost:8501. The Idle Wastage scenario now calculates idle power, idle duration, idle energy and idle-energy share, and correctly sends idle wastage to Warning/Recommendation rather than Maintenance.
